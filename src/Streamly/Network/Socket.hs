@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE UnboxedTuples #-}
@@ -7,7 +8,7 @@
 #include "inline.hs"
 
 -- |
--- Module      : Streamly.FileSystem.File
+-- Module      : Streamly.Network.Socket
 -- Copyright   : (c) 2018 Harendra Kumar
 --
 -- License     : BSD3
@@ -24,12 +25,12 @@
 -- programmer, the 'TextEncoding', 'NewLineMode', and 'Buffering' options of
 -- the underlying handle provided by GHC are not needed and ignored.
 --
--- > import qualified Streamly.FileSystem.File as File
+-- > import qualified Streamly.Network.Socket as SK
 --
 
-module Streamly.FileSystem.File
+module Streamly.Network.Socket
     (
-    -- * Streaming IO
+    -- * Streaming Network IO
     -- | Stream data to or from a file or device sequentially.  When reading,
     -- the stream is lazy and generated on-demand as the consumer consumes it.
     -- Read IO requests to the IO device are performed in chunks limited to a
@@ -47,12 +48,16 @@ module Streamly.FileSystem.File
     -- Devices like terminals, pipes, sockets and fifos do not have random
     -- access capability.
 
-    -- TODO file path based APIs
-    -- , readFile
-    -- , writeFile
+    -- TODO network address based APIs
+    -- , readAddr  -- fromAddr?
+    -- , writeAddr -- toAddr
 
-    -- ** Read File to Stream
-      read
+    -- ** Listen for Connections
+       TCPServerOpts(..)
+     , serveTCP
+
+    -- ** Read a stream from a connection
+      , read
     -- , readUtf8
     -- , readLines
     -- , readFrames
@@ -62,11 +67,11 @@ module Streamly.FileSystem.File
     -- , readArrayUpto
     -- , readArrayOf
 
-    , readArraysUpto
+    -- , readArraysUpto
     -- , readArraysOf
     , readArrays
 
-    -- ** Write File from Stream
+    -- ** Write a stream to a connection
     , write
     -- , writeUtf8
     -- , writeUtf8ByLines
@@ -76,33 +81,16 @@ module Streamly.FileSystem.File
     -- -- * Array Write
     , writeArray
     , writeArrays
-
-    -- -- * Random Access (Seek)
-    -- -- | Unlike the streaming APIs listed above, these APIs apply to devices or
-    -- files that have random access or seek capability.  This type of devices
-    -- include disks, files, memory devices and exclude terminals, pipes,
-    -- sockets and fifos.
-    --
-    -- , readIndex
-    -- , readSlice
-    -- , readSliceRev
-    -- , readAt -- read from a given position to th end of file
-    -- , readSliceArrayUpto
-    -- , readSliceArrayOf
-
-    -- , writeIndex
-    -- , writeSlice
-    -- , writeSliceRev
-    -- , writeAt -- start writing at the given position
-    -- , writeSliceArray
     )
 where
 
+import Control.Concurrent (threadWaitWrite, rtsSupportsBoundThreads)
 import Control.Monad.IO.Class (MonadIO(..))
+import Control.Monad (when)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Ptr (minusPtr, plusPtr)
+import Foreign.Ptr (minusPtr, plusPtr, Ptr, castPtr)
 import Foreign.Storable (Storable(..))
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import System.IO (Handle, hGetBufSome, hPutBuf)
@@ -118,18 +106,52 @@ import qualified Streamly.Mem.Array as A
 import qualified Streamly.Mem.Array.Types as A hiding (flattenArrays)
 import qualified Streamly.Prelude as S
 
--------------------------------------------------------------------------------
--- References
--------------------------------------------------------------------------------
+import Network.Socket hiding (listen)
+import qualified Network.Socket as Net
+-- import           Network.Socket.ByteString as NBS
+import           Streamly (MonadAsync)
+
+-- XXX we will need a concatMapWith parallel to merge all the connections
+-- concurrently.
 --
--- The following references may be useful to build an understanding about the
--- file API design:
---
--- http://www.linux-mag.com/id/308/ for blocking/non-blocking IO on linux.
--- https://lwn.net/Articles/612483/ Non-blocking buffered file read operations
--- https://en.wikipedia.org/wiki/C_file_input/output for C APIs.
--- https://docs.oracle.com/javase/tutorial/essential/io/file.html for Java API.
--- https://www.w3.org/TR/FileAPI/ for http file API.
+-------------------------------------------------------------------------------
+-- Listen
+-------------------------------------------------------------------------------
+
+data TCPServerOpts = TCPServerOpts
+    {
+      tcpAddressFamily :: !Family
+    , tcpSockOpts      :: ![(SocketOption, Int)]
+    , tcpSockAddr      :: !SockAddr
+    , tcpListenQ       :: !Int
+    }
+
+-- tcpSocketOptions = [(NS.NoDelay,1), (NS.ReuseAddr,1)]
+-- bind sock (SockAddrInet port 0)
+
+initListener :: TCPServerOpts -> IO Socket
+initListener TCPServerOpts{..} =
+  withSocketsDo $ do
+    sock <- socket tcpAddressFamily Stream defaultProtocol
+    mapM_ (\(opt, val) -> setSocketOption sock opt val) tcpSockOpts
+    bind sock tcpSockAddr
+    Net.listen sock tcpListenQ
+    return sock
+
+{-# INLINE serveTCP #-}
+serveTCP :: MonadAsync m => TCPServerOpts -> SerialT m (Socket, SockAddr)
+serveTCP opts = S.unfoldrM step Nothing
+    where
+    step Nothing = do
+        listener <- liftIO $ initListener opts
+        r <- liftIO $ accept listener
+        -- XXX error handling
+        return $ Just (r, Just listener)
+
+    step (Just listener) = do
+        r <- liftIO $ accept listener
+        -- XXX error handling
+        return $ Just (r, Just listener)
 
 -------------------------------------------------------------------------------
 -- Array IO (Input)
@@ -140,12 +162,12 @@ import qualified Streamly.Prelude as S
 -- then it immediately returns that data without blocking. It reads a maximum
 -- of up to the size requested.
 {-# INLINABLE readArrayUpto #-}
-readArrayUpto :: Int -> Handle -> IO (Array Word8)
+readArrayUpto :: Int -> Socket -> IO (Array Word8)
 readArrayUpto size h = do
     ptr <- mallocPlainForeignPtrBytes size
     -- ptr <- mallocPlainForeignPtrAlignedBytes size (alignment (undefined :: Word8))
     withForeignPtr ptr $ \p -> do
-        n <- hGetBufSome h p size
+        n <- recvBuf h p size
         let v = Array
                 { aStart = ptr
                 , aEnd   = p `plusPtr` n
@@ -159,13 +181,27 @@ readArrayUpto size h = do
 -- Array IO (output)
 -------------------------------------------------------------------------------
 
+waitWhen0 :: Int -> Socket -> IO ()
+waitWhen0 0 s = when rtsSupportsBoundThreads $
+    withFdSocket s $ \fd -> threadWaitWrite $ fromIntegral fd
+waitWhen0 _ _ = return ()
+
+sendAll :: Socket -> Ptr Word8 -> Int -> IO ()
+sendAll _ _ len | len <= 0 = return ()
+sendAll s p len = do
+    sent <- sendBuf s p len
+    waitWhen0 sent s
+    -- assert (sent <= len)
+    when (sent >= 0) $ sendAll s (p `plusPtr` sent) (len - sent)
+
 -- | Write an Array to a file handle.
 --
 -- @since 0.7.0
 {-# INLINABLE writeArray #-}
-writeArray :: Storable a => Handle -> Array a -> IO ()
+writeArray :: Storable a => Socket -> Array a -> IO ()
 writeArray _ arr | A.length arr == 0 = return ()
-writeArray h Array{..} = withForeignPtr aStart $ \p -> hPutBuf h p aLen
+writeArray h Array{..} = withForeignPtr aStart $ \p ->
+    sendAll h (castPtr p) aLen
     where
     aLen =
         let p = unsafeForeignPtrToPtr aStart
@@ -176,18 +212,19 @@ writeArray h Array{..} = withForeignPtr aStart $ \p -> hPutBuf h p aLen
 -------------------------------------------------------------------------------
 
 -- | @readArraysUpto size h@ reads a stream of arrays from file handle @h@.
--- The maximum size of a single array is specified by @size@. The actual size
--- read may be less than or equal to @size@.
+-- The maximum size of a single array is limited to @size@.
+-- 'fromHandleArraysUpto' ignores the prevailing 'TextEncoding' and 'NewlineMode'
+-- on the 'Handle'.
 {-# INLINABLE readArraysUpto #-}
 readArraysUpto :: (IsStream t, MonadIO m)
-    => Int -> Handle -> t m (Array Word8)
+    => Int -> Socket -> t m (Array Word8)
 readArraysUpto size h = go
   where
     -- XXX use cons/nil instead
-    go = mkStream $ \_ yld _ stp -> do
+    go = mkStream $ \_ yld sng _ -> do
         arr <- liftIO $ readArrayUpto size h
-        if A.length arr == 0
-        then stp
+        if A.length arr < size
+        then sng arr
         else yld arr go
 
 -- XXX read 'Array a' instead of Word8
@@ -197,11 +234,9 @@ readArraysUpto size h = go
 -- 'readArrays' ignores the prevailing 'TextEncoding' and 'NewlineMode'
 -- on the 'Handle'.
 --
--- > readArrays = readArraysUpto defaultChunkSize
---
 -- @since 0.7.0
 {-# INLINE readArrays #-}
-readArrays :: (IsStream t, MonadIO m) => Handle -> t m (Array Word8)
+readArrays :: (IsStream t, MonadIO m) => Socket -> t m (Array Word8)
 readArrays = readArraysUpto A.defaultChunkSize
 
 -------------------------------------------------------------------------------
@@ -231,7 +266,7 @@ readByChunksUpto chunkSize h = A.flattenArrays $ readArraysUpto chunkSize h
 --
 -- @since 0.7.0
 {-# INLINE read #-}
-read :: (IsStream t, MonadIO m) => Handle -> t m Word8
+read :: (IsStream t, MonadIO m) => Socket -> t m Word8
 read = A.flattenArrays . readArrays
 
 -------------------------------------------------------------------------------
@@ -242,7 +277,7 @@ read = A.flattenArrays . readArrays
 --
 -- @since 0.7.0
 {-# INLINE writeArrays #-}
-writeArrays :: (MonadIO m, Storable a) => Handle -> SerialT m (Array a) -> m ()
+writeArrays :: (MonadIO m, Storable a) => Socket -> SerialT m (Array a) -> m ()
 writeArrays h m = S.mapM_ (liftIO . writeArray h) m
 
 -- GHC buffer size dEFAULT_FD_BUFFER_SIZE=8192 bytes.
@@ -259,7 +294,7 @@ writeArrays h m = S.mapM_ (liftIO . writeArray h) m
 --
 -- @since 0.7.0
 {-# INLINE writeByChunks #-}
-writeByChunks :: MonadIO m => Int -> Handle -> SerialT m Word8 -> m ()
+writeByChunks :: MonadIO m => Int -> Socket -> SerialT m Word8 -> m ()
 writeByChunks n h m = writeArrays h $ A.arraysOf n m
 
 -- > write = 'writeByChunks' A.defaultChunkSize
@@ -270,7 +305,7 @@ writeByChunks n h m = writeArrays h $ A.arraysOf n m
 --
 -- @since 0.7.0
 {-# INLINE write #-}
-write :: MonadIO m => Handle -> SerialT m Word8 -> m ()
+write :: MonadIO m => Socket -> SerialT m Word8 -> m ()
 write = writeByChunks A.defaultChunkSize
 
 {-
@@ -346,89 +381,4 @@ readFrames = undefined -- foldFrames . read
 writeByFrames :: (IsStream t, MonadIO m, Storable a)
     => Array a -> Handle -> t m a -> m ()
 writeByFrames = undefined
-
--------------------------------------------------------------------------------
--- Random Access IO (Seek)
--------------------------------------------------------------------------------
-
--- XXX handles could be shared, so we may not want to use the handle state at
--- all for these APIs. we can use pread and pwrite instead. On windows we will
--- need to use readFile/writeFile with an offset argument.
-
--------------------------------------------------------------------------------
-
--- | Read the element at the given index treating the file as an array.
---
--- @since 0.7.0
-{-# INLINE readIndex #-}
-readIndex :: Storable a => Handle -> Int -> Maybe a
-readIndex arr i = undefined
-
--- NOTE: To represent a range to read we have chosen (start, size) instead of
--- (start, end). This helps in removing the ambiguity of whether "end" is
--- included in the range or not.
---
--- We could avoid specifying the range to be read and instead use "take size"
--- on the stream, but it may end up reading more and then consume it partially.
-
--- | @readSliceWith chunkSize handle pos len@ reads up to @len@ bytes
--- from @handle@ starting at the offset @pos@ from the beginning of the file.
---
--- Reads are performed in chunks of size @chunkSize@.  For block devices, to
--- avoid reading partial blocks @chunkSize@ must align with the block size of
--- the underlying device. If the underlying block size is unknown, it is a good
--- idea to keep it a multiple 4KiB. This API ensures that the start of each
--- chunk is aligned with @chunkSize@ from second chunk onwards.
---
-{-# INLINE readSliceWith #-}
-readSliceWith :: (IsStream t, MonadIO m, Storable a)
-    => Int -> Handle -> Int -> Int -> t m a
-readSliceWith chunkSize h pos len = undefined
-
--- | @readSlice h i count@ streams a slice from the file handle @h@ starting
--- at index @i@ and reading up to @count@ elements in the forward direction
--- ending at the index @i + count - 1@.
---
--- @since 0.7.0
-{-# INLINE readSlice #-}
-readSlice :: (IsStream t, MonadIO m, Storable a)
-    => Handle -> Int -> Int -> t m a
-readSlice = readSliceWith A.defaultChunkSize
-
--- | @readSliceRev h i count@ streams a slice from the file handle @h@ starting
--- at index @i@ and reading up to @count@ elements in the reverse direction
--- ending at the index @i - count + 1@.
---
--- @since 0.7.0
-{-# INLINE readSliceRev #-}
-readSliceRev :: (IsStream t, MonadIO m, Storable a)
-    => Handle -> Int -> Int -> t m a
-readSliceRev h i count = undefined
-
--- | Write the given element at the given index in the file.
---
--- @since 0.7.0
-{-# INLINE writeIndex #-}
-writeIndex :: (MonadIO m, Storable a) => Handle -> Int -> a -> m ()
-writeIndex h i a = undefined
-
--- | @writeSlice h i count stream@ writes a stream to the file handle @h@
--- starting at index @i@ and writing up to @count@ elements in the forward
--- direction ending at the index @i + count - 1@.
---
--- @since 0.7.0
-{-# INLINE writeSlice #-}
-writeSlice :: (IsStream t, Monad m, Storable a)
-    => Handle -> Int -> Int -> t m a -> m ()
-writeSlice h i len s = undefined
-
--- | @writeSliceRev h i count stream@ writes a stream to the file handle @h@
--- starting at index @i@ and writing up to @count@ elements in the reverse
--- direction ending at the index @i - count + 1@.
---
--- @since 0.7.0
-{-# INLINE writeSliceRev #-}
-writeSliceRev :: (IsStream t, Monad m, Storable a)
-    => Handle -> Int -> Int -> t m a -> m ()
-writeSliceRev arr i len s = undefined
 -}
