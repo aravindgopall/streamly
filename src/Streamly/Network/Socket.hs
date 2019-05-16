@@ -16,37 +16,24 @@
 -- Stability   : experimental
 -- Portability : GHC
 --
--- Read and write streams and arrays to and from files. File IO APIs are quite
--- similar to "Streamly.Mem.Array" read write APIs. In that regard, arrays can
--- be considered as in-memory files or files can be considered as on-disk
--- arrays.  IO APIs are divided into two categories, sequential streaming IO
--- APIs and random access IO APIs.  Control over the file reading and writing
--- behavior in terms of buffering, encoding, decoding is in the hands of the
--- programmer, the 'TextEncoding', 'NewLineMode', and 'Buffering' options of
--- the underlying handle provided by GHC are not needed and ignored.
+-- Read and write streams and arrays to and from network sockets. Socket IO
+-- APIs are quite similar to "Streamly.Mem.Array" read write APIs and almost
+-- identical to the sequential streaming APIs in "Streamly.FileSystem.File".
+--
+-- When reading, the stream is lazy and generated on-demand as the consumer
+-- consumes it.  Read IO requests to the IO device are performed in chunks
+-- limited to a maximum size of 32KiB, this is referred to as
+-- @defaultChunkSize@ in the documentation. One IO request may or may not read
+-- the full chunk. If the whole stream is not consumed, it is possible that we
+-- may read slightly more from the IO device than what the consumer needed.
+-- Unless specified otherwise in the API, writes are collected into chunks of
+-- @defaultChunkSize@ before they are written to the IO device.
 --
 -- > import qualified Streamly.Network.Socket as SK
 --
 
 module Streamly.Network.Socket
     (
-    -- * Streaming Network IO
-    -- | Stream data to or from a file or device sequentially.  When reading,
-    -- the stream is lazy and generated on-demand as the consumer consumes it.
-    -- Read IO requests to the IO device are performed in chunks limited to a
-    -- maximum size of 32KiB, this is referred to as @defaultChunkSize@ in the
-    -- documentation. One IO request may or may not read the full
-    -- chunk. If the whole stream is not consumed, it is possible that we may
-    -- read slightly more from the IO device than what the consumer needed.
-    -- Unless specified otherwise in the API, writes are collected into chunks
-    -- of @defaultChunkSize@ before they are written to the IO device.
-
-    -- Streaming APIs work for all kind of devices, seekable or non-seekable;
-    -- including disks, files, memory devices, terminals, pipes, sockets and
-    -- fifos. While random access APIs work only for files or devices that have
-    -- random access or seek capability for example disks, memory devices.
-    -- Devices like terminals, pipes, sockets and fifos do not have random
-    -- access capability.
 
     -- TODO network address based APIs
     -- , readAddr  -- fromAddr?
